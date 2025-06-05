@@ -1,0 +1,766 @@
+#include <Wire.h>
+#include <INA226.h>
+#include <WiFi.h>
+#include "esp_task_wdt.h"  // Watchdog library
+#include <ArduinoOTA.h>
+// ================== WATCHDOG CONFIGURATION ==================
+#define WDT_TIMEOUT 8  // Watchdog timeout in seconds
+
+// ================== WIFI CONFIGURATION ==================
+const char* ssid = "Omega_Robots";
+const char* password = "Omega@2022";
+
+// Static IP Configuration
+IPAddress local_IP(192, 168, 0, 191); // <- Change to 191 for the second device
+IPAddress gateway(192, 168, 0, 1);
+IPAddress subnet(255, 255, 255, 0);
+IPAddress dns(8, 8, 8, 8);
+
+// ================== TCP COMMUNICATION ==================
+WiFiServer server(8888);
+WiFiClient clientToPi;
+
+// Raspberry Pi IP and Port
+const char* raspi_ip = "192.168.0.189"; // Change if different
+const int raspi_port = 8888;
+
+// ================== MOTOR CONTROL PINS ==================
+const int R_Motor = 33;   // Right Enable
+const int F_Motor = 32;   // Left Enable
+
+// ================== SWITCH & SENSOR PINS ==================
+const int LIMIT_SWITCH_1 = 12; // 0m limit switch
+const int LIMIT_SWITCH_2 = 14; // 200m limit switch
+const int proximityPin   = 35; // Proximity (NO) switch
+const int START_BUTTON   = 15;  
+const int STOP_BUTTON    = 16;     
+const int EMERGENCY_BUTTON = 17;
+
+// ================== STATE FLAGS ==================
+bool emergencyState = false; 
+bool stopRequested = false;
+
+// ================== TIME CONTROL VARIABLES ==================
+unsigned long lastDetectionTime = 0; 
+unsigned long lastVoltageCheckTime = 0;
+unsigned long startTime = 0;
+
+// ================== MOVEMENT & MODE CONTROL ==================
+int cycleCount = 0;        // Tracks number of cycles in auto mode
+float totalCycles = 0;     // Tracks total cycles completed
+String currentMode = "stopped"; // Modes: stopped, auto, manual, moving
+String lastDirection = "";      // Tracks last movement direction
+
+// ================== LIMITS AND THRESHOLDS ==================
+const int maxCycles = 30;
+const int timeLimit = 15 * 1000; // Proximity limit (2 minutes)
+const unsigned long movementTimeout = 28 * 60 * 1000; // Movement timeout (10 minutes)
+const unsigned long voltageCheckInterval = 20 * 60 * 2000; // Voltage check interval
+float volt = 21; // Voltage threshold (adjust as needed)
+unsigned long lastCheckTime = 0;
+const unsigned long interval = 20 * 60 * 1000; 
+// ================== SENSOR ==================
+INA226 ina(0x40); // INA226 current sensor object
+
+// ================== FUNCTION DECLARATIONS ==================
+void stopMotor();
+void connectToWiFi();
+
+
+
+// =================== BOARD INITIALIZATION ===================
+void setup() {
+  Serial.begin(115200);
+  setupWDT();  // Initialize watchdog timer
+
+  // =================== PIN CONFIGURATION ===================
+
+  // Motor control pins
+  pinMode(F_Motor, OUTPUT);
+  pinMode(R_Motor, OUTPUT);
+  digitalWrite(F_Motor, HIGH);
+  digitalWrite(R_Motor, HIGH);
+
+  // Button pins
+  pinMode(START_BUTTON, INPUT_PULLUP);
+  pinMode(STOP_BUTTON, INPUT_PULLUP);
+  pinMode(EMERGENCY_BUTTON, INPUT_PULLUP);
+
+  // Limit switch pins
+  pinMode(LIMIT_SWITCH_1, INPUT_PULLUP);
+  pinMode(LIMIT_SWITCH_2, INPUT_PULLUP);
+
+  // Proximity sensor pin
+  pinMode(proximityPin, INPUT_PULLDOWN);
+
+  // =================== INITIAL STATES ===================
+  stopMotor();  // Ensure motors are stopped initially
+  lastDetectionTime = millis();  // Start time tracking for proximity
+
+  // =================== WIFI & SERVER ===================
+  connectToWiFi();
+  server.begin();
+ // ========== ✅ OTA SETUP ==========
+  ArduinoOTA
+    .onStart([]() {
+      Serial.println("🚀 OTA Start");
+    })
+    .onEnd([]() {
+      Serial.println("✅ OTA End");
+    })
+    .onProgress([](unsigned int progress, unsigned int total) {
+      Serial.printf("📦 OTA Progress: %u%%\r", (progress * 100) / total);
+    })
+    .onError([](ota_error_t error) {
+      Serial.printf("❌ OTA Error [%u]: ", error);
+      if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
+      else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
+      else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
+      else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
+      else if (error == OTA_END_ERROR) Serial.println("End Failed");
+    });
+
+  ArduinoOTA.begin();
+  // ========== ✅ END OTA SETUP ==========
+  // =================== INA226 SENSOR ===================
+  Wire.begin(21, 22);  // Initialize I2C with custom pins
+
+  if (!ina.begin()) {
+    Serial.println("INA226 init failed!");
+  } else {
+    Serial.println("INA226 init Success!");
+  }
+
+  ina.setMaxCurrentShunt(10.0, 0.1);  // Set max current to 10A with 0.1Ω shunt
+
+  // =================== INITIAL POSITIONING ===================
+  // If limit switch 1 is not pressed at startup, move in reverse to calibrate position
+
+
+  if (digitalRead(EMERGENCY_BUTTON) == LOW)
+  {
+      if (digitalRead(LIMIT_SWITCH_1) == HIGH) {
+        stopMotor();
+        moveUntilLimitSwitch(false);  // Move in reverse direction until switch is released
+        lastDetectionTime = millis(); // Reset detection time
+      }
+  }
+}
+
+// =================== MAIN LOOP ===================
+void loop() {
+  esp_task_wdt_reset();  // ✅ Keep watchdog alive
+  ArduinoOTA.handle();
+  
+  // ---------- Check button inputs ----------
+  checkButtons();
+
+  // ---------- Handle incoming TCP command ----------
+  WiFiClient client = server.available();
+  if (client && client.connected()) {
+    if (client.available()) {
+      String msg = client.readStringUntil('\n');
+      handleCommand(msg); 
+      client.stop();  // Close connection after reading
+    }
+  }
+
+  // ---------- Voltage monitoring ----------
+  float voltage = readVoltage();
+  if (voltage < volt) {
+    unsigned long currentMillis = millis();
+    if (currentMillis - lastVoltageCheckTime >= voltageCheckInterval) {
+      sendMessage("123/");  // Send low voltage alert
+      lastVoltageCheckTime = currentMillis;
+    }
+  }
+
+  // ---------- WiFi reconnect logic ----------
+  // static unsigned long wifiRetryStart = 0;
+  // if (WiFi.status() != WL_CONNECTED) {
+  //   if (wifiRetryStart == 0)
+  //     wifiRetryStart = millis();
+
+  //   if (millis() - wifiRetryStart < 5 * 60 * 1000) {
+  //     WiFi.begin(ssid, password);
+  //     esp_task_wdt_reset(); 
+  //     delay(1000);  // Short wait before retry
+  //   } 
+  // } 
+  // else {
+  //   wifiRetryStart = 0;  // Reset retry timer when connected
+  // }
+
+  // ---------- Optional: Uncomment if needed ----------
+  // unsigned long currentTime = millis();
+
+  // if (currentTime - lastCheckTime >= interval) {
+  //   lastCheckTime = currentTime;
+
+  //   if (digitalRead(LIMIT_SWITCH_1) == LOW) {
+  //     moveUntilLimitSwitch(false);
+  //   }
+  // }
+}
+
+
+void connectToWiFi() {
+  if (!WiFi.config(local_IP, gateway, subnet, dns)) {
+    Serial.println("❌ Failed to configure static IP");
+  }
+
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+
+  unsigned long startAttemptTime = millis();
+  const unsigned long wifiTimeout = 2 * 60 * 1000;  
+  while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < wifiTimeout) {
+    esp_task_wdt_reset();
+    delay(500);
+    Serial.print(".");
+    
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n✅ Connected. IP: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("\n⚠️ WiFi connection timeout after 4 minutes. Continuing without WiFi.");
+  }
+}
+
+
+
+// =================== Emergency Button Check Function ===================
+bool checkEmergency() {
+  if (digitalRead(EMERGENCY_BUTTON) == HIGH || digitalRead(STOP_BUTTON) == HIGH) {
+    emergencyState = true;
+    if(digitalRead(EMERGENCY_BUTTON) == HIGH){
+        stopMotor();
+        currentMode = "Stopped";
+        sendMessage("EMERGENCY/");
+        // Serial.println("EMERGENCY");
+    }
+    else{
+        stopMotor();
+        currentMode = "Stopped";
+        // Serial.println("Stop");
+    }
+
+    return false;
+  }
+  return true;
+}
+ 
+// ===================Button Check Function ===================
+void checkButtons() {
+  static unsigned long lastDebounceTime = 0;
+  const int debounceDelay = 3; 
+
+  // Debounce check
+  if (millis() - lastDebounceTime < debounceDelay) {
+    return; // wait
+  }
+
+  // START_BUTTON (NO, INPUT_PULLDOWN): goes HIGH when pressed
+  if (digitalRead(START_BUTTON) == LOW) {
+    // Serial.println("START_BUTTON");
+    handleCommand("start");
+    lastDebounceTime = millis();
+    return;
+  }
+
+  // STOP_BUTTON (NC, INPUT_PULLUP): goes LOW when pressed
+  else if (digitalRead(STOP_BUTTON) == HIGH) {
+    // Serial.println("STOP_BUTTON");
+    handleCommand("stop");
+    lastDebounceTime = millis();
+    return;
+  }
+
+  // EMERGENCY_BUTTON (NO, INPUT_PULLDOWN): goes HIGH when pressed
+  bool currentEmergency = digitalRead(EMERGENCY_BUTTON) == HIGH;
+  if (currentEmergency != emergencyState) {
+    emergencyState = currentEmergency;
+    // Serial.print("EMERGENCY_BUTTON: ");
+    // Serial.println(emergencyState ? "PRESSED" : "RELEASED");
+    lastDebounceTime = millis();
+    return;
+  }
+}
+
+
+
+// =================== Command Handling Function ===================
+bool handleCommand(String command) {
+  // إذا كان زر الطوارئ مفعل، قم بمنع أي أوامر بدء حركة
+
+  // float voltage = readVoltage();
+  float voltage = readVoltage();
+  if (voltage > volt) {
+    if (command == "start_auto") {
+      if (voltage >= 26) {
+        stopMotor();
+        // startAutoMode();
+      } else {
+        String message = "1234/" + String(voltage, 3);
+        sendMessage(message.c_str());
+      }
+      return true;
+    } 
+    else if (command == "start") {
+      // Serial.println("start");
+      startManualMode();
+      return true;
+    } 
+    else if (command == "stop") {
+      stopMotor();
+      currentMode = "Stopped";
+      // Serial.println("stop");
+      sendMessage("7891/");
+      return true;
+    }
+    else if (command == "forward") {
+      stopMotor();
+      moveUntilLimitSwitch(true); // Move forward
+      return true;
+    }
+    else if (command == "backward") {
+      stopMotor();
+      moveUntilLimitSwitch(false); // Move backward
+      return true;
+    }
+    else if (command == "status") {
+      sendStatus(voltage); // Send status
+      return true;
+    }
+    else if (command == "restart") {
+      sendMessage("3343/");
+      delay(100);
+      sendMessage("Please wait 5 minutes before operating.");
+      restartESP();
+      return true;
+    }
+  } 
+  else{
+    String message = "55556/" + String(voltage, 3);
+    sendMessage(message.c_str());
+  }
+  return false;
+}
+
+
+
+// =================== Manual Mode Function ===================
+void startManualMode() {
+  currentMode = "manual";
+
+  if (!checkEmergency()) return;
+
+  sendMessage("🚀Start Save Energy.");
+  moveForward();
+  startTime = millis() - 90; 
+  lastDetectionTime = millis();
+
+  // المرحلة الأولى: التحرك حتى تفعيل LIMIT_SWITCH_1
+  while (digitalRead(LIMIT_SWITCH_1) == LOW) {
+    if (!checkAllConditions()) return;
+    if (isTimeoutExceeded(startTime)) {
+      handleTimeout();
+      return;
+    }
+    delay(10);
+  }
+
+  // دورة واحدة فقط
+  for (int i = 0; i < 1; i++) {
+    // التحرك حتى الوصول لأحد Limit Switch
+    while ( digitalRead(LIMIT_SWITCH_2) == HIGH) {
+      if (!checkAllConditions()) return;
+      if (isTimeoutExceeded(startTime)) {
+        handleTimeout();
+        return;
+      }
+      delay(10);
+    }
+
+if (digitalRead(LIMIT_SWITCH_2) == LOW) {
+      stopMotor();
+      moveBackward();
+      startTime = millis() - 90;
+      lastDetectionTime = millis();
+    }
+    startTime = millis() - 90;
+    // LIMIT_SWITCH_2
+    while (digitalRead(LIMIT_SWITCH_2) == LOW) {
+      if (!checkAllConditions()) return;
+      if (isTimeoutExceeded(startTime)) {
+        handleTimeout();
+        return;
+      }
+      delay(10);
+    }
+
+    totalCycles++;
+    startTime = millis() - 90;
+  }
+
+  // العودة حتى تفعيل LIMIT_SWITCH_1
+  while (digitalRead(LIMIT_SWITCH_1) == HIGH) {
+    if (!checkAllConditions()) return;
+    if (isTimeoutExceeded(startTime)) {
+      handleTimeout();
+      return;
+    }
+    delay(10);
+  }
+
+  stopMotor();
+  currentMode = "Stopped";
+  totalCycles++;
+  sendMessage("1234567/");
+}
+
+// =================== Move Until a Limit Switch is Triggered ===================
+void moveUntilLimitSwitch(bool isForward) {
+  currentMode = "Just move";
+  startTime = millis();
+  lastDetectionTime = millis();
+
+  if (isForward) {
+    moveForward();
+      while (digitalRead(LIMIT_SWITCH_1) == LOW) {
+    if (!checkAllConditions()) return;
+    if (isTimeoutExceeded(startTime)) {
+      handleTimeout();
+      return;
+    }
+    delay(10);
+  }
+    
+  } else {
+    moveBackward();
+      while (digitalRead(LIMIT_SWITCH_2) == LOW) {
+    if (!checkAllConditions()) return;
+    if (isTimeoutExceeded(startTime)) {
+      handleTimeout();
+      return;
+    }
+    delay(10);
+  }
+  }
+
+
+  while (digitalRead(LIMIT_SWITCH_1) == HIGH && digitalRead(LIMIT_SWITCH_2) == HIGH) {
+    if (!checkAllConditions()) {
+      stopMotor();
+      return;
+    }
+
+    if (isTimeoutExceeded(startTime)) {
+      handleTimeout();
+      return;
+    }
+
+    delay(10);
+  }
+
+  stopMotor();
+  lastDetectionTime = millis();
+
+  if (digitalRead(LIMIT_SWITCH_1) == LOW) {
+    sendMessage("12/At charging point");
+  } else if (digitalRead(LIMIT_SWITCH_2) == LOW) {
+    sendMessage("12/Not at charging point");
+  }
+
+  currentMode = "Stopped";
+  totalCycles++;
+  startTime = millis();
+}
+
+
+// =================== Emergency Movement Until a Limit Switch is Triggered ===================
+void moveUntilLimitSwitchsafe(bool isForward, bool first_time = true, int attempt = 0) {
+  const int maxAttempts = 1;
+  currentMode = "Emergency return";
+  lastDetectionTime = millis();
+  
+  if (isForward) {
+    moveForward();
+    while (digitalRead(LIMIT_SWITCH_1) == LOW) {
+    esp_task_wdt_reset(); 
+    if (!checkEmergency() || !receiveMessage()) {
+      stopMotor();
+      return;
+    }
+    if (isTimeoutExceeded(startTime)) {
+      handleTimeout();
+      return;
+    }
+    delay(10);
+  }
+    
+  } else {
+    moveBackward();
+    esp_task_wdt_reset(); 
+    while (digitalRead(LIMIT_SWITCH_2) == LOW) {
+    esp_task_wdt_reset(); 
+    if (!checkEmergency() || !receiveMessage()) {
+      stopMotor();
+      return;
+    }
+    if (isTimeoutExceeded(startTime)) {
+      handleTimeout();
+      return;
+    }
+    delay(10);
+  }
+  }
+
+  startTime = millis() - 90;
+
+  while (digitalRead(LIMIT_SWITCH_1) == HIGH && digitalRead(LIMIT_SWITCH_2) == HIGH) {
+    esp_task_wdt_reset(); 
+    if (!checkEmergency() || !receiveMessage()) {
+      stopMotor();
+      return;
+    }
+
+    if (isTimeoutExceeded2(startTime)) {
+      esp_task_wdt_reset(); 
+      stopMotor();
+      sendMessage("1212/");
+      currentMode = "Stopped";
+      sendMessage("000/");
+
+      if (attempt >= maxAttempts) {
+        esp_task_wdt_reset(); 
+        sendMessage("999/");
+        currentMode = "Stuck";
+        stopMotor();
+        return;
+      }
+      moveUntilLimitSwitchsafe(isForward, false, attempt + 1);
+      return;
+    }
+    delay(10);
+  }
+
+  stopMotor();
+  lastDetectionTime = millis();
+
+  if (digitalRead(LIMIT_SWITCH_1) == LOW) {
+    sendMessage("122/");
+  } else if (digitalRead(LIMIT_SWITCH_2) == LOW) {
+    sendMessage("12/Not at charging point");
+  } else {
+    currentMode = "Stuck";
+    sendMessage("299/");
+  }
+
+  currentMode = "Stopped";
+  totalCycles++;
+  startTime = millis() - 90;
+}
+
+
+//=================== التحكم في المحرك ====================
+void moveForward()  {
+  lastDirection = "Forward";
+  digitalWrite(F_Motor, LOW);
+  digitalWrite(R_Motor, HIGH);
+  sendMessage("@1");
+}
+
+void moveBackward() {
+  lastDirection = "Backward";
+  digitalWrite(F_Motor, HIGH);
+  digitalWrite(R_Motor, LOW);
+  sendMessage("@1");
+}
+
+void stopMotor() {
+  digitalWrite(F_Motor, HIGH);
+  digitalWrite(R_Motor, HIGH);
+  delay(100);
+}
+//=================== Voltage Reader ====================
+float readVoltage() {
+  
+  if (!ina.begin()) {
+    return 26.2;
+  }
+  delay(20);
+  return ina.getBusVoltage();
+}
+
+// float readVoltage() {
+//   // ina.getBusVoltage()
+//   return 26.21;
+// }
+
+// float readVoltage() {
+//   if (!ina.begin()) {
+//     Serial.println("INA226 I2C communication failed!");
+//     return -1.0;
+//   }
+//   return ina.getBusVoltage();
+// }
+
+
+
+//=================== إرسال الرسائل ====================
+void sendMessage(const char* message) {
+  esp_task_wdt_reset(); 
+  if (clientToPi.connect(raspi_ip, raspi_port)) {
+    clientToPi.println(message);
+ 
+    clientToPi.stop();
+  } 
+}
+
+
+bool receiveMessage() {
+  
+  WiFiClient client = server.available();  // Check for incoming client
+
+  if (client && client.available()) {
+    String receivedCommand = client.readStringUntil('\n');
+    receivedCommand.trim();
+    if (receivedCommand == "start" || receivedCommand == "stop" ||
+        receivedCommand == "forward" || receivedCommand == "backward" ||
+        receivedCommand == "restart") {
+        handleCommand(receivedCommand);
+      return false  ;// Return true if command handled successfully
+    } 
+    else if (receivedCommand == "status") {
+      float voltage = readVoltage();
+      sendStatus(voltage);
+      return true;
+    } 
+    else {
+      return true;  
+    }
+  }
+
+  return true;  // No client or no message — no problem
+}
+
+
+
+bool checkProximity() {
+   
+  if (digitalRead(proximityPin) == HIGH) {
+    lastDetectionTime = millis();
+    return true;
+  }
+  if (millis() - lastDetectionTime > timeLimit) {
+    sendMessage("6767/");
+    currentMode = "Stopped";
+    sendMessage("000/");
+    moveUntilLimitSwitchsafe(false);
+    stopMotor();
+    return false;
+  }
+  return true;
+}
+
+bool checkProximitysafe() {
+ 
+  if (digitalRead(proximityPin) == HIGH) {
+    lastDetectionTime = millis();
+    return true;
+  }
+  if (millis() - lastDetectionTime > timeLimit) {
+    currentMode = "Stuck";
+    stopMotor();
+    sendMessage("299/");
+    return false;
+  }
+  return true;
+}
+
+bool checkVoltageAndHandle() {
+  float voltage = readVoltage();
+  if (voltage < volt) {
+    if (voltage > 19) {
+      stopMotor();
+      char message[64];
+      snprintf(message, sizeof(message), "55556/%.3f", fabs(voltage));
+      currentMode = "Stopped";
+      sendMessage(message);
+      sendMessage("000/");
+      moveUntilLimitSwitchsafe(false);
+      return false;
+    }
+  }
+  return true;
+}
+
+
+void sendStatus(float voltage) {
+  voltage = ina.getBusVoltage();
+  char message[128];
+  snprintf(message, sizeof(message), "1/%.3f2/%s", voltage, currentMode.c_str());
+
+  if (currentMode == "startAutoMode") {
+    char temp[32];
+    snprintf(temp, sizeof(temp), "3/%d", cycleCount);
+    strncat(message, temp, sizeof(message) - strlen(message) - 1);
+  }
+
+  char cycleInfo[32];
+cycleInfo[0] = '4';
+cycleInfo[1] = '/';
+cycleInfo[2] = '\0'; // null-terminator
+  strncat(message, cycleInfo, sizeof(message) - strlen(message) - 1);
+
+  if (currentMode == "Just move") {
+    char dirInfo[32];
+    snprintf(dirInfo, sizeof(dirInfo), "5/%s", lastDirection.c_str());
+    strncat(message, dirInfo, sizeof(message) - strlen(message) - 1);
+  }
+
+  sendMessage(message);
+}
+
+void restartESP() {
+  delay(1000);
+  ESP.restart();
+}
+
+bool isTimeoutExceeded(unsigned long since) {
+  return millis() - since > movementTimeout;
+}
+
+bool isTimeoutExceeded2(unsigned long since) {
+  return millis() - since > (60 *1000);
+}
+
+bool checkAllConditions() {
+  esp_task_wdt_reset();  // Optional extra safety
+  return checkEmergency() && checkProximity() && checkVoltageAndHandle() && receiveMessage();
+}
+
+void handleTimeout() {
+  stopMotor();
+  sendMessage("1212/");
+  currentMode = "Stopped";
+  sendMessage("000/");
+  moveUntilLimitSwitchsafe(false);
+  stopMotor();
+}
+
+void setupWDT() {
+  const esp_task_wdt_config_t wdt_config = {
+    .timeout_ms = WDT_TIMEOUT * 1000,
+    .idle_core_mask = (1 << portNUM_PROCESSORS) - 1,  // All cores
+    .trigger_panic = true
+  };
+  esp_task_wdt_init(&wdt_config);  // Pass struct pointer
+  esp_task_wdt_add(NULL);  // Add current task (main loop)
+}
+
+
+
