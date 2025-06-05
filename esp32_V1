@@ -48,8 +48,44 @@ unsigned long startTime = 0;
 // ================== MOVEMENT & MODE CONTROL ==================
 int cycleCount = 0;        // Tracks number of cycles in auto mode
 float totalCycles = 0;     // Tracks total cycles completed
-String currentMode = "stopped"; // Modes: stopped, auto, manual, moving
-String lastDirection = "";      // Tracks last movement direction
+
+enum Mode {
+  MODE_STOPPED,
+  MODE_MANUAL,
+  MODE_JUST_MOVE,
+  MODE_EMERGENCY_RETURN,
+  MODE_STUCK,
+  MODE_AUTO
+};
+
+enum Direction {
+  DIR_NONE,
+  DIR_FORWARD,
+  DIR_BACKWARD
+};
+
+Mode currentMode = MODE_STOPPED;  // Modes: stopped, auto, manual, moving
+Direction lastDirection = DIR_NONE;      // Tracks last movement direction
+
+const char* modeToString(Mode mode) {
+  switch (mode) {
+    case MODE_STOPPED:          return "Stopped";
+    case MODE_MANUAL:           return "manual";
+    case MODE_JUST_MOVE:        return "Just move";
+    case MODE_EMERGENCY_RETURN: return "Emergency return";
+    case MODE_STUCK:            return "Stuck";
+    case MODE_AUTO:             return "startAutoMode";
+    default:                    return "";
+  }
+}
+
+const char* directionToString(Direction dir) {
+  switch (dir) {
+    case DIR_FORWARD:  return "Forward";
+    case DIR_BACKWARD: return "Backward";
+    default:           return "";
+  }
+}
 
 // ================== LIMITS AND THRESHOLDS ==================
 const int maxCycles = 30;
@@ -61,10 +97,13 @@ unsigned long lastCheckTime = 0;
 const unsigned long interval = 20 * 60 * 1000; 
 // ================== SENSOR ==================
 INA226 ina(0x40); // INA226 current sensor object
+bool inaInitialized = false;
 
 // ================== FUNCTION DECLARATIONS ==================
 void stopMotor();
 void connectToWiFi();
+const char* modeToString(Mode mode);
+const char* directionToString(Direction dir);
 
 
 
@@ -125,13 +164,16 @@ void setup() {
   // =================== INA226 SENSOR ===================
   Wire.begin(21, 22);  // Initialize I2C with custom pins
 
-  if (!ina.begin()) {
+  inaInitialized = ina.begin();
+  if (!inaInitialized) {
     Serial.println("INA226 init failed!");
   } else {
     Serial.println("INA226 init Success!");
   }
 
-  ina.setMaxCurrentShunt(10.0, 0.1);  // Set max current to 10A with 0.1Ω shunt
+  if (inaInitialized) {
+    ina.setMaxCurrentShunt(10.0, 0.1);  // Set max current to 10A with 0.1Ω shunt
+  }
 
   // =================== INITIAL POSITIONING ===================
   // If limit switch 1 is not pressed at startup, move in reverse to calibrate position
@@ -237,13 +279,13 @@ bool checkEmergency() {
     emergencyState = true;
     if(digitalRead(EMERGENCY_BUTTON) == HIGH){
         stopMotor();
-        currentMode = "Stopped";
+        currentMode = MODE_STOPPED;
         sendMessage("EMERGENCY/");
         // Serial.println("EMERGENCY");
     }
     else{
         stopMotor();
-        currentMode = "Stopped";
+        currentMode = MODE_STOPPED;
         // Serial.println("Stop");
     }
 
@@ -315,7 +357,7 @@ bool handleCommand(String command) {
     } 
     else if (command == "stop") {
       stopMotor();
-      currentMode = "Stopped";
+      currentMode = MODE_STOPPED;
       // Serial.println("stop");
       sendMessage("7891/");
       return true;
@@ -353,7 +395,7 @@ bool handleCommand(String command) {
 
 // =================== Manual Mode Function ===================
 void startManualMode() {
-  currentMode = "manual";
+  currentMode = MODE_MANUAL;
 
   if (!checkEmergency()) return;
 
@@ -416,14 +458,14 @@ if (digitalRead(LIMIT_SWITCH_2) == LOW) {
   }
 
   stopMotor();
-  currentMode = "Stopped";
+  currentMode = MODE_STOPPED;
   totalCycles++;
   sendMessage("1234567/");
 }
 
 // =================== Move Until a Limit Switch is Triggered ===================
 void moveUntilLimitSwitch(bool isForward) {
-  currentMode = "Just move";
+  currentMode = MODE_JUST_MOVE;
   startTime = millis();
   lastDetectionTime = millis();
 
@@ -474,7 +516,7 @@ void moveUntilLimitSwitch(bool isForward) {
     sendMessage("12/Not at charging point");
   }
 
-  currentMode = "Stopped";
+  currentMode = MODE_STOPPED;
   totalCycles++;
   startTime = millis();
 }
@@ -483,7 +525,7 @@ void moveUntilLimitSwitch(bool isForward) {
 // =================== Emergency Movement Until a Limit Switch is Triggered ===================
 void moveUntilLimitSwitchsafe(bool isForward, bool first_time = true, int attempt = 0) {
   const int maxAttempts = 1;
-  currentMode = "Emergency return";
+  currentMode = MODE_EMERGENCY_RETURN;
   lastDetectionTime = millis();
   
   if (isForward) {
@@ -531,13 +573,13 @@ void moveUntilLimitSwitchsafe(bool isForward, bool first_time = true, int attemp
       esp_task_wdt_reset(); 
       stopMotor();
       sendMessage("1212/");
-      currentMode = "Stopped";
+      currentMode = MODE_STOPPED;
       sendMessage("000/");
 
       if (attempt >= maxAttempts) {
         esp_task_wdt_reset(); 
         sendMessage("999/");
-        currentMode = "Stuck";
+        currentMode = MODE_STUCK;
         stopMotor();
         return;
       }
@@ -555,11 +597,11 @@ void moveUntilLimitSwitchsafe(bool isForward, bool first_time = true, int attemp
   } else if (digitalRead(LIMIT_SWITCH_2) == LOW) {
     sendMessage("12/Not at charging point");
   } else {
-    currentMode = "Stuck";
+    currentMode = MODE_STUCK;
     sendMessage("299/");
   }
 
-  currentMode = "Stopped";
+  currentMode = MODE_STOPPED;
   totalCycles++;
   startTime = millis() - 90;
 }
@@ -567,14 +609,14 @@ void moveUntilLimitSwitchsafe(bool isForward, bool first_time = true, int attemp
 
 //=================== التحكم في المحرك ====================
 void moveForward()  {
-  lastDirection = "Forward";
+  lastDirection = DIR_FORWARD;
   digitalWrite(F_Motor, LOW);
   digitalWrite(R_Motor, HIGH);
   sendMessage("@1");
 }
 
 void moveBackward() {
-  lastDirection = "Backward";
+  lastDirection = DIR_BACKWARD;
   digitalWrite(F_Motor, HIGH);
   digitalWrite(R_Motor, LOW);
   sendMessage("@1");
@@ -587,8 +629,7 @@ void stopMotor() {
 }
 //=================== Voltage Reader ====================
 float readVoltage() {
-  
-  if (!ina.begin()) {
+  if (!inaInitialized) {
     return 26.2;
   }
   delay(20);
@@ -657,7 +698,7 @@ bool checkProximity() {
   }
   if (millis() - lastDetectionTime > timeLimit) {
     sendMessage("6767/");
-    currentMode = "Stopped";
+    currentMode = MODE_STOPPED;
     sendMessage("000/");
     moveUntilLimitSwitchsafe(false);
     stopMotor();
@@ -673,7 +714,7 @@ bool checkProximitysafe() {
     return true;
   }
   if (millis() - lastDetectionTime > timeLimit) {
-    currentMode = "Stuck";
+    currentMode = MODE_STUCK;
     stopMotor();
     sendMessage("299/");
     return false;
@@ -688,7 +729,7 @@ bool checkVoltageAndHandle() {
       stopMotor();
       char message[64];
       snprintf(message, sizeof(message), "55556/%.3f", fabs(voltage));
-      currentMode = "Stopped";
+      currentMode = MODE_STOPPED;
       sendMessage(message);
       sendMessage("000/");
       moveUntilLimitSwitchsafe(false);
@@ -700,11 +741,10 @@ bool checkVoltageAndHandle() {
 
 
 void sendStatus(float voltage) {
-  voltage = ina.getBusVoltage();
   char message[128];
-  snprintf(message, sizeof(message), "1/%.3f2/%s", voltage, currentMode.c_str());
+  snprintf(message, sizeof(message), "1/%.3f2/%s", voltage, modeToString(currentMode));
 
-  if (currentMode == "startAutoMode") {
+  if (currentMode == MODE_AUTO) {
     char temp[32];
     snprintf(temp, sizeof(temp), "3/%d", cycleCount);
     strncat(message, temp, sizeof(message) - strlen(message) - 1);
@@ -716,9 +756,9 @@ cycleInfo[1] = '/';
 cycleInfo[2] = '\0'; // null-terminator
   strncat(message, cycleInfo, sizeof(message) - strlen(message) - 1);
 
-  if (currentMode == "Just move") {
+  if (currentMode == MODE_JUST_MOVE) {
     char dirInfo[32];
-    snprintf(dirInfo, sizeof(dirInfo), "5/%s", lastDirection.c_str());
+    snprintf(dirInfo, sizeof(dirInfo), "5/%s", directionToString(lastDirection));
     strncat(message, dirInfo, sizeof(message) - strlen(message) - 1);
   }
 
@@ -746,7 +786,7 @@ bool checkAllConditions() {
 void handleTimeout() {
   stopMotor();
   sendMessage("1212/");
-  currentMode = "Stopped";
+  currentMode = MODE_STOPPED;
   sendMessage("000/");
   moveUntilLimitSwitchsafe(false);
   stopMotor();
